@@ -8,7 +8,8 @@ class AudioFrame(
     val high: Float,          // 0..1
     val beatCount: Long,      // растёт на 1 при каждом ударе
     val spectrum: FloatArray, // SPECTRUM_SIZE полос, 0..1
-    val waveform: FloatArray  // WAVE_SIZE сэмплов, -1..1
+    val waveform: FloatArray, // WAVE_SIZE сэмплов, -1..1
+    val peak: Float = 0f      // пик блока после усиления (>= 0,98 = клиппинг)
 ) {
     companion object {
         const val SPECTRUM_SIZE = 64

@@ -29,18 +29,32 @@ class OverlayView(context: Context) : View(context) {
     private var barSide = SIDE_LEFT
     private var barUntil = 0L
 
+    /** false = OSD выключен: индикаторы и обычные сообщения не показываются. */
+    var osdEnabled: Boolean = true
+        set(value) {
+            field = value
+            if (!value) {
+                message = null
+                barUntil = 0L
+                postInvalidateOnAnimation()
+            }
+        }
+
     init {
         paint.textAlign = Paint.Align.CENTER
         paint.typeface = Typeface.MONOSPACE
     }
 
-    fun showMessage(text: String, durationMs: Long = 1400L) {
+    /** force = true: показать даже при выключенном OSD (ошибки, подсказка выхода). */
+    fun showMessage(text: String, durationMs: Long = 1400L, force: Boolean = false) {
+        if (!osdEnabled && !force) return
         message = text
         messageUntil = SystemClock.uptimeMillis() + durationMs
         postInvalidateOnAnimation()
     }
 
     fun showBar(fraction: Float, label: String, side: Int) {
+        if (!osdEnabled) return
         barFraction = fraction.coerceIn(0f, 1f)
         barLabel = label
         barSide = side

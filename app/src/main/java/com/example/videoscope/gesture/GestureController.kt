@@ -10,8 +10,9 @@ import kotlin.math.exp
  * Зоны экрана:
  *  - левая полоса (20% ширины, с отступом от края под жест «Назад»): вертикальный свайп = gain
  *  - правая полоса (20%): вертикальный свайп = параметр режима (цвет / скорость / ширина)
- *  - центр: свайп влево/вправо = режим, вертикальный свайп = сила глитча
- *  - тап = ручной глитч, двойной тап = пауза, долгое нажатие = максимальный глитч
+ *  - центр: свайп влево/вправо = режим, вертикальный свайп = общая сила эффектов
+ *  - тап = ручной глитч, двойной тап = пауза (если разрешена в меню), долгое нажатие = максимальный глитч
+ *  - тап двумя пальцами = открыть/закрыть меню (работает и при открытом меню)
  */
 class GestureController(context: Context, private val listener: Listener) {
 
@@ -23,6 +24,7 @@ class GestureController(context: Context, private val listener: Listener) {
         fun onTap()
         fun onDoubleTap()
         fun onHold(active: Boolean)
+        fun onMenuToggle()
     }
 
     private enum class Zone { GAIN, PARAM, CENTER }
@@ -32,6 +34,9 @@ class GestureController(context: Context, private val listener: Listener) {
     private var zone = Zone.CENTER
     private var holding = false
     private var centerVertical: Boolean? = null
+    private var twoFingerCandidate = false
+    private var twoFingerDownTime = 0L
+    private var swallow = false
 
     private val detector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
 
@@ -91,10 +96,37 @@ class GestureController(context: Context, private val listener: Listener) {
         }
     })
 
-    fun onTouchEvent(ev: MotionEvent, width: Int): Boolean {
+    /**
+     * gesturesEnabled = false (меню открыто): обычные жесты не обрабатываются,
+     * остаётся только тап двумя пальцами для закрытия меню.
+     */
+    fun onTouchEvent(ev: MotionEvent, width: Int, gesturesEnabled: Boolean = true): Boolean {
         viewWidth = if (width < 1) 1 else width
-        val handled = detector.onTouchEvent(ev)
         val action = ev.actionMasked
+
+        // после возврата жестов игнорируем остаток текущего касания до нового ACTION_DOWN
+        var feed = gesturesEnabled
+        if (!gesturesEnabled) {
+            swallow = true
+        } else if (swallow) {
+            if (action == MotionEvent.ACTION_DOWN) swallow = false else feed = false
+        }
+        val handled = if (feed) detector.onTouchEvent(ev) else true
+
+        when (action) {
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                twoFingerCandidate = ev.pointerCount == 2
+                twoFingerDownTime = ev.eventTime
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (twoFingerCandidate && ev.eventTime - twoFingerDownTime < 250L) {
+                    listener.onMenuToggle()
+                }
+                twoFingerCandidate = false
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> twoFingerCandidate = false
+        }
+
         if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && holding) {
             holding = false
             listener.onHold(false)

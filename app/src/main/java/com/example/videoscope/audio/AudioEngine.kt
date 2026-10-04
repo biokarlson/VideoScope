@@ -1,12 +1,16 @@
 package com.example.videoscope.audio
 
 import android.annotation.SuppressLint
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.SystemClock
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.pow
@@ -29,6 +33,24 @@ class AudioEngine {
 
     @Volatile var gain: Float = 1f
 
+    /** Чувствительность детектора удара, 0..1 (0,5 = прежние пороги). */
+    @Volatile var beatSensitivity: Float = 0.5f
+
+    /** Реакция на звук: 0 = резкая, 1 = плавная (0,5 = прежнее сглаживание). */
+    @Volatile var reaction: Float = 0.5f
+
+    /** Источник: 0 = обычный (MIC), 1 = без обработки (UNPROCESSED, если поддерживается). */
+    @Volatile var source: Int = 0
+
+    /** Предпочтительное устройство ввода (например, USB) или null = автоматически. */
+    @Volatile var preferredDevice: AudioDeviceInfo? = null
+
+    /** Автоусиление: медленная подстройка поверх ручного усиления в пределах ±2 ступеней. */
+    @Volatile var autoGain: Boolean = false
+
+    /** Текущая поправка автоусиления в ступенях (для индикации). */
+    @Volatile var autoStep: Float = 0f
+
     @Volatile
     var frame: AudioFrame = AudioFrame.EMPTY
         private set
@@ -44,18 +66,16 @@ class AudioEngine {
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
         if (minBuf <= 0) return false
-        val rec = try {
-            AudioRecord(
-                MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                max(minBuf, HOP * 8)
-            )
-        } catch (e: Exception) {
-            return false
+        val bufSize = max(minBuf, HOP * 8)
+        var created: AudioRecord? = null
+        if (source == 1 && Build.VERSION.SDK_INT >= 24) {
+            created = createRecord(MediaRecorder.AudioSource.UNPROCESSED, bufSize)
         }
-        if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            rec.release()
-            return false
+        if (created == null) created = createRecord(MediaRecorder.AudioSource.MIC, bufSize)
+        val rec = created ?: return false
+        val device = preferredDevice
+        if (device != null && Build.VERSION.SDK_INT >= 23) {
+            rec.setPreferredDevice(device)
         }
         try {
             rec.startRecording()
@@ -67,6 +87,24 @@ class AudioEngine {
         running = true
         thread = Thread({ loop(rec) }, "AudioEngine").also { it.start() }
         return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun createRecord(audioSource: Int, bufSize: Int): AudioRecord? {
+        return try {
+            val r = AudioRecord(
+                audioSource, SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize
+            )
+            if (r.state == AudioRecord.STATE_INITIALIZED) {
+                r
+            } else {
+                r.release()
+                null
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     fun stop() {
@@ -86,8 +124,13 @@ class AudioEngine {
     private fun toLevel(amp: Float, floorDb: Float, rangeDb: Float): Float =
         ((20f * log10(amp + 1e-9f) - floorDb) / rangeDb).coerceIn(0f, 1f)
 
-    private fun smooth(prev: Float, v: Float, attack: Float, decay: Float): Float =
-        if (v > prev) prev + (v - prev) * attack else prev * decay + v * (1f - decay)
+    /** Сглаживание: быстрый подъём, медленный спад. Ползунок реакции смещает оба коэффициента. */
+    private fun smooth(prev: Float, v: Float, attack: Float, decay: Float): Float {
+        val f = (reaction - 0.5f) * 2f // -1 = резкая, +1 = плавная
+        val a = (attack * (1f - 0.6f * f)).coerceIn(0.05f, 1f)
+        val d = (1f - (1f - decay) * (1f - 0.7f * f)).coerceIn(0f, 0.995f)
+        return if (v > prev) prev + (v - prev) * a else prev * d + v * (1f - d)
+    }
 
     private fun loop(rec: AudioRecord) {
         val spec = AudioFrame.SPECTRUM_SIZE
@@ -127,6 +170,7 @@ class AudioEngine {
         var beatCount = 0L
         var avgBassEnergy = 0f
         var lastBeatMs = 0L
+        var avgRms = 0f
 
         while (running) {
             // 1. читаем блок PCM
@@ -139,16 +183,31 @@ class AudioEngine {
             if (read < HOP) break
 
             // 2. сдвигаем окно и добавляем новые сэмплы (с учётом gain)
-            val g = gain
+            val g = gain * (if (autoGain) 2f.pow(autoStep) else 1f)
             System.arraycopy(window, HOP, window, 0, FFT_SIZE - HOP)
+            var blockPeak = 0f
             for (i in 0 until HOP) {
-                window[FFT_SIZE - HOP + i] = (pcm[i] / 32768f * g).coerceIn(-1f, 1f)
+                val raw = pcm[i] / 32768f * g
+                val a = abs(raw)
+                if (a > blockPeak) blockPeak = a
+                window[FFT_SIZE - HOP + i] = raw.coerceIn(-1f, 1f)
             }
 
             // 3. RMS по последним 1024 сэмплам
             var sum = 0f
             for (i in FFT_SIZE - 1024 until FFT_SIZE) sum += window[i] * window[i]
             val rms = sqrt(sum / 1024f)
+
+            // автоусиление: медленная подстройка к целевому уровню, в тишине не меняется
+            avgRms += (rms - avgRms) * (1f / 170f)
+            if (autoGain) {
+                if (avgRms > 0.004f) {
+                    val err = ln(0.12f / avgRms) / ln(2f)
+                    autoStep = (autoStep + err.coerceIn(-1f, 1f) * 0.004f).coerceIn(-2f, 2f)
+                }
+            } else if (autoStep != 0f) {
+                autoStep = 0f
+            }
 
             // 4. осциллограмма со «стабилизацией» по переходу через ноль
             var start = 1024
@@ -200,15 +259,18 @@ class AudioEngine {
 
             // 9. удар: энергия баса против скользящего среднего (~1 с)
             val now = SystemClock.elapsedRealtime()
-            if (bassEnergy > avgBassEnergy * 1.7f + 2e-7f &&
-                bassLevel > 0.3f && now - lastBeatMs > 160
+            val sens = beatSensitivity
+            val ratio = (2.5f - 1.6f * sens).coerceAtLeast(1.1f) // 0,5 -> 1,7
+            val gate = 0.4f - 0.2f * sens                         // 0,5 -> 0,3
+            if (bassEnergy > avgBassEnergy * ratio + 2e-7f &&
+                bassLevel > gate && now - lastBeatMs > 160
             ) {
                 beatCount++
                 lastBeatMs = now
             }
             avgBassEnergy += (bassEnergy - avgBassEnergy) * (1f / 86f)
 
-            frame = AudioFrame(sRms, sBass, sMid, sHigh, beatCount, spectrumOut, wave)
+            frame = AudioFrame(sRms, sBass, sMid, sHigh, beatCount, spectrumOut, wave, blockPeak)
         }
     }
 }
