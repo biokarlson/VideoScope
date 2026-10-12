@@ -2,6 +2,7 @@ package com.example.videoscope.ui
 
 import android.app.AlertDialog
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -10,12 +11,14 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import com.example.videoscope.gl.GLRenderer
+import java.io.File
 import java.util.Locale
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -66,6 +69,35 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
         fun setGestureLock(v: Boolean)
         fun resetTab(index: Int)                      // 0 = Видео, 1 = Аудио, 2 = Интерфейс
         fun resetAll()
+        fun getTextCeiling(): Float
+        fun setTextCeiling(v: Float)
+        fun getDistSource(): Int                      // 0 полная, 1 середина+высокие, 2 высокие
+        fun setDistSource(i: Int)
+        fun getDistWindow(): Float                    // дБ, 6..30
+        fun setDistWindow(v: Float)
+        fun startCalibration()
+        fun getCalibrationRemaining(): Int            // секунд до конца калибровки, 0 = не идёт
+        fun getFullDb(): Float
+        fun getDriverDb(): Float                      // уровень выбранного источника, дБ
+        fun getCenterDb(): Float                      // центр калибровки выбранного источника, дБ
+        fun loadClubPreset()
+        fun getPhotoFiles(): List<File>
+        fun getMaxPhotos(): Int
+        fun pickPhotos()
+        fun deletePhoto(index: Int)
+        fun nextPhoto()
+        fun isPhotoAuto(): Boolean
+        fun setPhotoAuto(v: Boolean)
+        fun getPhotoInterval(): Float                 // секунд, 0,5..10
+        fun setPhotoInterval(v: Float)
+        fun isPhotoSwap(): Boolean
+        fun setPhotoSwap(v: Boolean)
+        fun getPhotoSwapSize(): Float
+        fun setPhotoSwapSize(v: Float)
+        fun isPhotoFit(): Boolean
+        fun setPhotoFit(v: Boolean)
+        fun getGlitchText(): String
+        fun setGlitchText(text: String)
         fun getSpeedMul(): Float                      // ползунок 0..1, 0,5 = x1
         fun setSpeedMul(v: Float)
         fun getReaction(): Float                      // 0 = резкая, 1 = плавная
@@ -98,6 +130,8 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
     // индикатор уровня на вкладке «Аудио»: обновляется, пока панель видна
     private var meter: LevelMeterView? = null
     private var autoText: TextView? = null
+    private var statusText: TextView? = null
+    private var calText: TextView? = null
     private val meterUpdater = object : Runnable {
         override fun run() {
             val m = meter ?: return
@@ -109,6 +143,29 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
                     "Автоподстройка: " + String.format(Locale.US, "%+.2f", host.getAutoStep()) + " ступени"
                 } else {
                     "Автоусиление выключено"
+                }
+            }
+            val st = statusText
+            if (st != null) {
+                val full = host.getFullDb()
+                val hint = when {
+                    host.getPeak() >= 0.98f -> "Клиппинг: уменьшите усиление"
+                    full < -70f -> "Тишина"
+                    full < -55f -> "Слишком тихо: прибавьте усиление или подойдите ближе"
+                    else -> "Уровень в норме"
+                }
+                st.text = String.format(
+                    Locale.US, "Источник: %.1f дБ, центр: %.1f дБ, окно: %.0f дБ. %s",
+                    host.getDriverDb(), host.getCenterDb(), host.getDistWindow(), hint
+                )
+            }
+            val ct = calText
+            if (ct != null) {
+                val left = host.getCalibrationRemaining()
+                ct.text = if (left > 0) {
+                    "Калибровка… осталось " + left + " с. Пусть играет обычная музыка."
+                } else {
+                    "Калибровка измеряет обычный уровень звука (8 секунд) для всех трёх источников."
                 }
             }
             postDelayed(this, 50L)
@@ -183,6 +240,8 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
         removeCallbacks(meterUpdater)
         meter = null
         autoText = null
+        statusText = null
+        calText = null
         host.setLastTab(index)
         for (i in tabViews.indices) {
             val selected = i == index
@@ -290,6 +349,8 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
 
         buildEffects()
         buildSpeed()
+        buildGlitchText()
+        buildPhotos()
         buildStartMode()
         buildPixelSize()
         buildBorder()
@@ -309,7 +370,7 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
         val names = arrayOf("VHS", "Glitch", "Noise")
         val infos = arrayOf(
             "плывущая полоса, scanlines, rolling bars, виньетка",
-            "сдвиги строк, цветной глитч, блоки-помехи, мерцание, RGB-кайма",
+            "сдвиги строк, цветной глитч широкими строками (в ЧБ и монохроме меняется яркость), мерцание, RGB-кайма",
             "аналоговый шум"
         )
         for (i in names.indices) {
@@ -409,6 +470,134 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
         content.addView(smallText("От ×0,25 до ×4: как быстро меняются формы и цвета в режимах. Эффекты и удары не затрагиваются."))
     }
 
+    /** Текст режима Text Glitch: показывается текущий, изменяется через окно ввода. */
+    private fun buildGlitchText() {
+        content.addView(sectionLabel("Text Glitch: текст"))
+        val current = TextView(context)
+        current.setTextColor(Color.WHITE)
+        current.textSize = 15f
+        current.setPadding(0, dp(2), 0, dp(6))
+        current.text = host.getGlitchText()
+        content.addView(current, LinearLayout.LayoutParams(matchParent, wrapContent))
+
+        content.addView(simpleButton("Изменить текст…") {
+            val input = EditText(context)
+            input.setSingleLine(true)
+            input.filters = arrayOf(InputFilter.LengthFilter(28), InputFilter.AllCaps())
+            input.setText(host.getGlitchText())
+            input.setSelection(input.text.length)
+            AlertDialog.Builder(context)
+                .setTitle("Текст для Text Glitch")
+                .setView(input)
+                .setPositiveButton("Сохранить") { _, _ ->
+                    val value = input.text.toString().trim()
+                    if (value.isNotEmpty()) {
+                        host.setGlitchText(value)
+                        current.text = value
+                    }
+                }
+                .setNegativeButton("Отмена", null)
+                .show()
+        }, LinearLayout.LayoutParams(matchParent, wrapContent))
+        val ceiling = sliderRow("Потолок искажения", host.getTextCeiling()) { host.setTextCeiling(it) }
+        content.addView(ceiling.first, LinearLayout.LayoutParams(matchParent, wrapContent))
+        content.addView(
+            smallText(
+                "Искажение зависит от текущего уровня звука (источник, диапазон реакции и калибровка на вкладке «Аудио»): " +
+                    "чем громче, тем сильнее, но не выше потолка. " +
+                    "Параметр на правой полосе жестов в режиме Text Glitch: ускорение сдвига строк."
+            )
+        )
+    }
+
+    /** Фото для режима Photo Glitch: добавление, список, автосмена по звуку. */
+    private fun buildPhotos() {
+        content.addView(sectionLabel("Photo Glitch: фото"))
+        val files = host.getPhotoFiles()
+        content.addView(smallText("Фото: " + files.size + " из " + host.getMaxPhotos()))
+        content.addView(simpleButton("Добавить фото…") { host.pickPhotos() }, LinearLayout.LayoutParams(matchParent, wrapContent))
+
+        for (i in files.indices) {
+            val row = LinearLayout(context)
+            row.orientation = HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+
+            val thumb = ImageView(context)
+            thumb.scaleType = ImageView.ScaleType.CENTER_CROP
+            val opts = BitmapFactory.Options()
+            opts.inSampleSize = 8
+            thumb.setImageBitmap(BitmapFactory.decodeFile(files[i].path, opts))
+            row.addView(thumb, LinearLayout.LayoutParams(dp(56), dp(40)))
+
+            val label = TextView(context)
+            label.text = "Фото " + (i + 1)
+            label.setTextColor(Color.WHITE)
+            label.textSize = 14f
+            val labelLp = LinearLayout.LayoutParams(0, wrapContent, 1f)
+            labelLp.leftMargin = dp(10)
+            row.addView(label, labelLp)
+
+            val del = resetButton("✕") {
+                host.deletePhoto(i)
+                refresh()
+            }
+            del.setPadding(dp(14), dp(10), dp(14), dp(10))
+            row.addView(del, LinearLayout.LayoutParams(wrapContent, wrapContent))
+
+            val lp = LinearLayout.LayoutParams(matchParent, wrapContent)
+            lp.topMargin = dp(6)
+            content.addView(row, lp)
+        }
+
+        content.addView(
+            switchRow("Автосмена по звуку", host.isPhotoAuto()) { host.setPhotoAuto(it) },
+            LinearLayout.LayoutParams(matchParent, wrapContent)
+        )
+        content.addView(smallText("Фото меняется на акцентах: чем громче музыка, тем чаще. В тишине смены нет."))
+
+        content.addView(sectionLabel("Минимальный интервал смены"))
+        val intervalText = TextView(context)
+        intervalText.setTextColor(Color.WHITE)
+        intervalText.textSize = 15f
+        fun fmt(sec: Float): String = String.format(Locale.US, "%.1f с", sec)
+        intervalText.text = fmt(host.getPhotoInterval())
+        content.addView(intervalText, LinearLayout.LayoutParams(matchParent, wrapContent))
+        val bar = SeekBar(context)
+        bar.max = 95 // от 0,5 до 10 секунд с шагом 0,1
+        bar.progress = ((host.getPhotoInterval() - 0.5f) * 10f).roundToInt().coerceIn(0, 95)
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                val sec = 0.5f + progress / 10f
+                intervalText.text = fmt(sec)
+                if (fromUser) host.setPhotoInterval(sec)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        content.addView(bar, LinearLayout.LayoutParams(matchParent, dp(36)))
+
+        content.addView(sectionLabel("Показ"))
+        content.addView(
+            segmented(arrayOf("Заполнить", "Вписать"), if (host.isPhotoFit()) 1 else 0) { host.setPhotoFit(it == 1) }
+        )
+        content.addView(
+            switchRow("Обмен кусков", host.isPhotoSwap()) { host.setPhotoSwap(it) },
+            LinearLayout.LayoutParams(matchParent, wrapContent)
+        )
+        content.addView(
+            smallText("Случайные прямоугольники меняются местами и могут частично накладываться. Кик: крупные, середина: средние, высокие: мелкие.")
+        )
+        val swapSize = sliderRow("Размер кусков", host.getPhotoSwapSize()) { host.setPhotoSwapSize(it) }
+        content.addView(swapSize.first, LinearLayout.LayoutParams(matchParent, wrapContent))
+        content.addView(simpleButton("Следующее фото") { host.nextPhoto() }, resetLp())
+        content.addView(
+            smallText(
+                "Искажения: сдвиг срезов, мозаика, RGB shift, обмен кусков, всё от звука. " +
+                    "Параметр на правой полосе жестов в режиме Photo Glitch: потолок искажения."
+            )
+        )
+    }
+
     private fun buildMicSource() {
         content.addView(sectionLabel("Источник микрофона"))
         content.addView(
@@ -489,6 +678,12 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
                 list.addView(row, lp)
             }
         }
+
+        content.addView(simpleButton("Пресет «Клуб»: загрузить") {
+            host.loadClubPreset()
+            refresh()
+        }, LinearLayout.LayoutParams(matchParent, wrapContent))
+        content.addView(smallText("«Клуб»: усиление −3 ступени, искажение от средних и высоких, окно 12 дБ, автоусиление выключено. Затем откалибруйте на месте (вкладка «Аудио»)."))
 
         content.addView(simpleButton("Сохранить текущие настройки…") {
             val input = EditText(context)
@@ -696,11 +891,11 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
         row.gravity = Gravity.CENTER_VERTICAL
 
         val bar = SeekBar(context)
-        bar.max = 16 // от -2 до +2 с шагом 0,25
-        bar.progress = ((host.getGainStep() + 2f) * 4f).roundToInt().coerceIn(0, 16)
+        bar.max = 32 // от -6 до +2 с шагом 0,25
+        bar.progress = ((host.getGainStep() + 6f) * 4f).roundToInt().coerceIn(0, 32)
         bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                val step = progress / 4f - 2f
+                val step = progress / 4f - 6f
                 valueText.text = gainText(step)
                 if (fromUser) host.setGainStep(step)
             }
@@ -717,7 +912,7 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
         reset.setBackgroundColor(Color.argb(60, 255, 255, 255))
         reset.setPadding(dp(14), dp(6), dp(14), dp(6))
         reset.setOnClickListener {
-            bar.progress = 8
+            bar.progress = 24
             host.setGainStep(0f)
             valueText.text = gainText(0f)
         }
@@ -733,6 +928,12 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
             smallText("Подберите усиление так, чтобы полоса доходила до жёлтой зоны, а красный квадрат справа не загорался.")
         )
         meter = m
+        val statusView = TextView(context)
+        statusView.setTextColor(Color.LTGRAY)
+        statusView.textSize = 12f
+        statusView.setPadding(0, dp(4), 0, dp(2))
+        content.addView(statusView)
+        statusText = statusView
         post(meterUpdater)
 
         content.addView(
@@ -746,6 +947,48 @@ class MenuPanel(context: Context, private val host: Host) : LinearLayout(context
         at.setPadding(0, dp(2), 0, dp(2))
         content.addView(at)
         autoText = at
+
+        // источник искажения, диапазон реакции и калибровка (Text Glitch и Photo Glitch)
+        content.addView(sectionLabel("Чем управляется искажение"))
+        content.addView(
+            segmented(arrayOf("Полная", "Средние+высокие", "Высокие"), host.getDistSource().coerceIn(0, 2)) {
+                host.setDistSource(it)
+            }
+        )
+        content.addView(smallText("«Средние+высокие» лучше реагирует на нарастание, когда бас почти не меняется. Для Text Glitch и Photo Glitch."))
+
+        content.addView(sectionLabel("Диапазон реакции"))
+        val windowText = TextView(context)
+        windowText.setTextColor(Color.WHITE)
+        windowText.textSize = 15f
+        windowText.text = String.format(Locale.US, "%.0f дБ", host.getDistWindow())
+        content.addView(windowText, LinearLayout.LayoutParams(matchParent, wrapContent))
+        val windowBar = SeekBar(context)
+        windowBar.max = 24 // от 6 до 30 дБ
+        windowBar.progress = (host.getDistWindow() - 6f).roundToInt().coerceIn(0, 24)
+        windowBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                val db = 6f + progress
+                windowText.text = String.format(Locale.US, "%.0f дБ", db)
+                if (fromUser) host.setDistWindow(db)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        content.addView(windowBar, LinearLayout.LayoutParams(matchParent, dp(36)))
+        content.addView(smallText("Меньше: искажение резче реагирует на небольшие изменения громкости. Больше: плавнее."))
+
+        content.addView(sectionLabel("Калибровка"))
+        content.addView(
+            simpleButton("Откалибровать сейчас") { host.startCalibration() },
+            LinearLayout.LayoutParams(matchParent, wrapContent)
+        )
+        val ct = TextView(context)
+        ct.setTextColor(Color.GRAY)
+        ct.textSize = 12f
+        ct.setPadding(0, dp(4), 0, dp(4))
+        content.addView(ct)
+        calText = ct
 
         content.addView(sectionLabel("Чувствительность удара"))
         val beat = sliderRow(null, host.getBeatSensitivity()) { host.setBeatSensitivity(it) }

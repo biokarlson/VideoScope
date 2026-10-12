@@ -51,6 +51,46 @@ class AudioEngine {
     /** Текущая поправка автоусиления в ступенях (для индикации). */
     @Volatile var autoStep: Float = 0f
 
+    // ----- калибровка: измерение обычного уровня звука для трёх источников искажения -----
+    @Volatile private var calibrating = false
+    @Volatile private var calPending = false
+    @Volatile private var calStartMs = 0L
+    @Volatile private var calDurationMs = 8000L
+    @Volatile private var calResult: FloatArray? = null
+    private val calFull = ArrayList<Float>()
+    private val calMidHigh = ArrayList<Float>()
+    private val calHigh = ArrayList<Float>()
+
+    /** Запустить калибровку: ближайшие durationMs миллисекунд собираются уровни (тишина не учитывается). */
+    fun startCalibration(durationMs: Long = 8000L) {
+        calStartMs = SystemClock.elapsedRealtime()
+        calDurationMs = durationMs
+        calResult = null
+        calPending = true
+        calibrating = true
+    }
+
+    fun isCalibrating(): Boolean = calibrating
+
+    /** Сколько секунд осталось до конца калибровки (0, если она не идёт). */
+    fun calibrationRemainingSec(): Int {
+        if (!calibrating) return 0
+        val left = calDurationMs - (SystemClock.elapsedRealtime() - calStartMs)
+        return (left / 1000L + 1L).toInt().coerceAtLeast(1)
+    }
+
+    /** Результат калибровки: центры [полная, средние+высокие, высокие] в дБ, пустой массив = слишком тихо; null = ещё нет. */
+    fun takeCalibrationResult(): FloatArray? {
+        val r = calResult
+        if (r != null) calResult = null
+        return r
+    }
+
+    private fun median(list: ArrayList<Float>): Float {
+        val s = list.sorted()
+        return s[s.size / 2]
+    }
+
     @Volatile
     var frame: AudioFrame = AudioFrame.EMPTY
         private set
@@ -109,6 +149,7 @@ class AudioEngine {
 
     fun stop() {
         running = false
+        calibrating = false
         try {
             thread?.join(500)
         } catch (_: InterruptedException) {
@@ -171,6 +212,21 @@ class AudioEngine {
         var avgBassEnergy = 0f
         var lastBeatMs = 0L
         var avgRms = 0f
+        var sDbFull = -100f
+        var sDbMidHigh = -100f
+        var sDbHigh = -100f
+        // детекторы акцентов середины и высоких: скачок энергии полосы над её средним (~0,5 с)
+        var avgMid = 0f
+        var avgHigh = 0f
+        var lastMidMs = 0L
+        var lastHighMs = 0L
+        var midOnsets = 0L
+        var highOnsets = 0L
+        // минимальный интервал между ударами зависит от темпа: около 60% недавнего периода, 200..400 мс
+        val ivs = LongArray(8)
+        var ivCount = 0
+        var ivPos = 0
+        var minInt = 250L
 
         while (running) {
             // 1. читаем блок PCM
@@ -241,6 +297,37 @@ class AudioEngine {
             for (i in midHi until highHi) if (amp[i] > highMax) highMax = amp[i]
             val highLevel = toLevel(highMax, -80f, 55f)
 
+            // источники искажения в дБ: полная громкость, середина+высокие, высокие
+            var eMidHigh = 0f
+            for (i in bassHi until highHi) eMidHigh += amp[i] * amp[i]
+            var eHigh = 0f
+            for (i in midHi until highHi) eHigh += amp[i] * amp[i]
+            val dFull = 20f * log10(rms + 1e-9f)
+            val dMidHigh = 10f * log10(eMidHigh + 1e-12f)
+            val dHigh = 10f * log10(eHigh + 1e-12f)
+
+            // калибровка: собираем исходные (несглаженные) значения
+            if (calPending) {
+                calPending = false
+                calFull.clear()
+                calMidHigh.clear()
+                calHigh.clear()
+            }
+            if (calibrating) {
+                if (SystemClock.elapsedRealtime() - calStartMs >= calDurationMs) {
+                    calibrating = false
+                    calResult = if (calFull.size >= 50) {
+                        floatArrayOf(median(calFull), median(calMidHigh), median(calHigh))
+                    } else {
+                        FloatArray(0)
+                    }
+                } else if (dFull > -70f) {
+                    calFull.add(dFull)
+                    calMidHigh.add(dMidHigh)
+                    calHigh.add(dHigh)
+                }
+            }
+
             // 7. спектр
             val spectrumOut = FloatArray(spec)
             for (k in 0 until spec) {
@@ -256,6 +343,9 @@ class AudioEngine {
             sBass = smooth(sBass, bassLevel, 0.7f, 0.88f)
             sMid = smooth(sMid, midLevel, 0.6f, 0.9f)
             sHigh = smooth(sHigh, highLevel, 0.8f, 0.8f)
+            sDbFull = smooth(sDbFull, dFull, 0.5f, 0.9f)
+            sDbMidHigh = smooth(sDbMidHigh, dMidHigh, 0.5f, 0.9f)
+            sDbHigh = smooth(sDbHigh, dHigh, 0.6f, 0.85f)
 
             // 9. удар: энергия баса против скользящего среднего (~1 с)
             val now = SystemClock.elapsedRealtime()
@@ -263,14 +353,40 @@ class AudioEngine {
             val ratio = (2.5f - 1.6f * sens).coerceAtLeast(1.1f) // 0,5 -> 1,7
             val gate = 0.4f - 0.2f * sens                         // 0,5 -> 0,3
             if (bassEnergy > avgBassEnergy * ratio + 2e-7f &&
-                bassLevel > gate && now - lastBeatMs > 160
+                bassLevel > gate && now - lastBeatMs > minInt
             ) {
+                val d = now - lastBeatMs
+                if (d in 150L..1200L) {
+                    ivs[ivPos] = d
+                    ivPos = (ivPos + 1) % ivs.size
+                    if (ivCount < ivs.size) ivCount++
+                    val med = ivs.copyOf(ivCount).sorted()[ivCount / 2]
+                    minInt = (med * 0.6f).toLong().coerceIn(200L, 400L)
+                }
                 beatCount++
                 lastBeatMs = now
             }
             avgBassEnergy += (bassEnergy - avgBassEnergy) * (1f / 86f)
 
-            frame = AudioFrame(sRms, sBass, sMid, sHigh, beatCount, spectrumOut, wave, blockPeak)
+            var eMid = 0f
+            for (i in bassHi until midHi) eMid += amp[i] * amp[i]
+            val midRatio = (3.0f - 1.6f * sens).coerceAtLeast(1.4f)   // 0,5 -> 2,2
+            val highRatio = (2.3f - 1.6f * sens).coerceAtLeast(1.2f)  // 0,5 -> 1,5
+            if (eMid > avgMid * midRatio + 1e-7f && now - lastMidMs > 200L) {
+                midOnsets++
+                lastMidMs = now
+            }
+            if (eHigh > avgHigh * highRatio + 1e-8f && now - lastHighMs > 120L) {
+                highOnsets++
+                lastHighMs = now
+            }
+            avgMid += (eMid - avgMid) * (1f / 43f)
+            avgHigh += (eHigh - avgHigh) * (1f / 43f)
+
+            frame = AudioFrame(
+                sRms, sBass, sMid, sHigh, beatCount, spectrumOut, wave, blockPeak,
+                sDbFull, sDbMidHigh, sDbHigh, midOnsets, highOnsets
+            )
         }
     }
 }

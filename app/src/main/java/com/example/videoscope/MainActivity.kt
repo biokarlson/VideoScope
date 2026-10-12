@@ -9,6 +9,8 @@ import android.media.AudioManager
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
@@ -25,12 +27,15 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.videoscope.audio.AudioEngine
 import com.example.videoscope.config.AppSettings
+import com.example.videoscope.config.PhotoStore
 import com.example.videoscope.config.PresetStore
 import com.example.videoscope.gesture.GestureController
 import com.example.videoscope.gesture.OverlayView
 import com.example.videoscope.gl.GLRenderer
 import com.example.videoscope.ui.MenuPanel
 import com.example.videoscope.ui.StartScreenView
+import java.io.File
+import org.json.JSONObject
 import java.util.Locale
 import kotlin.math.ln
 import kotlin.math.pow
@@ -46,6 +51,7 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
     private lateinit var gestures: GestureController
     private lateinit var menu: MenuPanel
     private lateinit var presets: PresetStore
+    private lateinit var photos: PhotoStore
     private lateinit var startScreen: StartScreenView
 
     private var gainStep = 0f
@@ -128,7 +134,7 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
         }
         override fun getGainStep(): Float = gainStep
         override fun setGainStep(v: Float) {
-            gainStep = v.coerceIn(-2f, 2f)
+            gainStep = v.coerceIn(-6f, 2f)
             gainRaw = gainStep
             audio.gain = gainMul()
         }
@@ -185,6 +191,99 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
             renderer.mode = 0
             renderer.param = params[0]
             saveSettings()
+        }
+        override fun getTextCeiling(): Float = renderer.textCeil
+        override fun setTextCeiling(v: Float) {
+            renderer.textCeil = v.coerceIn(0f, 1f)
+            settings.textCeiling = renderer.textCeil
+        }
+        override fun getDistSource(): Int = renderer.distSource
+        override fun setDistSource(i: Int) {
+            renderer.distSource = i.coerceIn(0, 2)
+            settings.distSource = renderer.distSource
+        }
+        override fun getDistWindow(): Float = renderer.distWindow
+        override fun setDistWindow(v: Float) {
+            renderer.distWindow = v.coerceIn(6f, 30f)
+            settings.distWindow = renderer.distWindow
+        }
+        override fun startCalibration() {
+            if (!hasMic()) {
+                overlay.showMessage("Нет доступа к микрофону", 2500L, true)
+                return
+            }
+            audio.startCalibration(8000L)
+            overlay.showMessage("Калибровка: 8 секунд, пусть играет обычная музыка", 3500L, true)
+            uiHandler.removeCallbacks(calibrationPoll)
+            uiHandler.postDelayed(calibrationPoll, 400L)
+        }
+        override fun getCalibrationRemaining(): Int = audio.calibrationRemainingSec()
+        override fun getFullDb(): Float = audio.frame.dbFull
+        override fun getDriverDb(): Float = currentDriverDb()
+        override fun getCenterDb(): Float = currentCenterDb()
+        override fun loadClubPreset() {
+            val club = JSONObject()
+            club.put("gainStep", -3.0)
+            club.put("autoGain", false)
+            club.put("distSource", 1)
+            club.put("distWindow", 12.0)
+            club.put("calCenterFull", -30.0)
+            club.put("calCenterMidHigh", -35.0)
+            club.put("calCenterHigh", -42.0)
+            club.put("beatSensitivity", 0.5)
+            club.put("reaction", 0.5)
+            settings.importPreset(club)
+            loadLiveFromSettings()
+            overlay.showMessage("Пресет «Клуб» загружен", 2500L, true)
+        }
+        override fun getPhotoFiles(): List<File> = photos.files()
+        override fun getMaxPhotos(): Int = PhotoStore.MAX
+        override fun pickPhotos() {
+            if (photos.files().size >= PhotoStore.MAX) {
+                overlay.showMessage("Лимит: " + PhotoStore.MAX + " фото. Удалите ненужные.", 3000L, true)
+            } else {
+                this@MainActivity.pickPhotos.launch("image/*")
+            }
+        }
+        override fun deletePhoto(index: Int) {
+            val files = photos.files()
+            if (index in files.indices) {
+                photos.delete(files[index])
+                refreshPhotos()
+            }
+        }
+        override fun nextPhoto() {
+            renderer.requestNextPhoto()
+        }
+        override fun isPhotoAuto(): Boolean = renderer.photoAuto
+        override fun setPhotoAuto(v: Boolean) {
+            renderer.photoAuto = v
+            settings.photoAuto = v
+        }
+        override fun getPhotoInterval(): Float = renderer.photoMinInterval
+        override fun setPhotoInterval(v: Float) {
+            renderer.photoMinInterval = v.coerceIn(0.5f, 10f)
+            settings.photoInterval = renderer.photoMinInterval
+        }
+        override fun isPhotoSwap(): Boolean = renderer.photoSwap
+        override fun setPhotoSwap(v: Boolean) {
+            renderer.photoSwap = v
+            settings.photoSwap = v
+        }
+        override fun getPhotoSwapSize(): Float = renderer.photoSwapSize
+        override fun setPhotoSwapSize(v: Float) {
+            renderer.photoSwapSize = v.coerceIn(0f, 1f)
+            settings.photoSwapSize = renderer.photoSwapSize
+        }
+        override fun isPhotoFit(): Boolean = renderer.photoFit
+        override fun setPhotoFit(v: Boolean) {
+            renderer.photoFit = v
+            settings.photoFit = v
+        }
+        override fun getGlitchText(): String = renderer.text
+        override fun setGlitchText(text: String) {
+            renderer.text = text
+            settings.glitchText = text
         }
         override fun getSpeedMul(): Float = renderer.speedSlider
         override fun setSpeedMul(v: Float) {
@@ -254,6 +353,68 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
             if (granted) startAudio() else showNoMic()
         }
 
+    // выбор нескольких фото для Photo Glitch (системный выбор, отдельное разрешение не нужно)
+    private val pickPhotos =
+        registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+            if (uris != null && uris.isNotEmpty()) {
+                overlay.showMessage("Добавляю фото…", 2000L, true)
+                Thread {
+                    val added = photos.add(uris)
+                    runOnUiThread {
+                        refreshPhotos()
+                        overlay.showMessage("Добавлено фото: " + added, 2500L, true)
+                        if (menuOpen) menu.refresh()
+                    }
+                }.start()
+            }
+        }
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+
+    /** Ждёт результата калибровки (8 секунд) и применяет его. */
+    private val calibrationPoll = object : Runnable {
+        override fun run() {
+            val r = audio.takeCalibrationResult()
+            if (r == null) {
+                if (audio.isCalibrating()) uiHandler.postDelayed(this, 300L)
+                return
+            }
+            if (r.size == 3) {
+                renderer.centerFull = r[0]
+                renderer.centerMidHigh = r[1]
+                renderer.centerHigh = r[2]
+                settings.calCenterFull = r[0]
+                settings.calCenterMidHigh = r[1]
+                settings.calCenterHigh = r[2]
+                overlay.showMessage(
+                    String.format(Locale.US, "Калибровка готова: центр %.1f дБ", currentCenterDb()), 3500L, true
+                )
+            } else {
+                overlay.showMessage("Слишком тихо: калибровка не выполнена", 3500L, true)
+            }
+        }
+    }
+
+    private fun currentDriverDb(): Float {
+        val f = audio.frame
+        return when (renderer.distSource) {
+            0 -> f.dbFull
+            1 -> f.dbMidHigh
+            else -> f.dbHigh
+        }
+    }
+
+    private fun currentCenterDb(): Float = when (renderer.distSource) {
+        0 -> renderer.centerFull
+        1 -> renderer.centerMidHigh
+        else -> renderer.centerHigh
+    }
+
+    private fun refreshPhotos() {
+        renderer.photoFiles = photos.files()
+        renderer.photosVersion = renderer.photosVersion + 1
+    }
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     /** Множитель усиления: 2 в степени ступени (-2..+2 даёт x0,25..x4). */
@@ -285,7 +446,9 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
             it.autoGain = settings.autoGain
         }
         audio.preferredDevice = findDevice(settings.micDevice)
+        photos = PhotoStore(this)
         renderer = GLRenderer(audio, settings)
+        renderer.photoFiles = photos.files()
 
         glView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
@@ -380,6 +543,18 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
         settings.beatSensitivity = audio.beatSensitivity
         settings.reaction = audio.reaction
         settings.speedMul = renderer.speedSlider
+        settings.glitchText = renderer.text
+        settings.textCeiling = renderer.textCeil
+        settings.distSource = renderer.distSource
+        settings.distWindow = renderer.distWindow
+        settings.calCenterFull = renderer.centerFull
+        settings.calCenterMidHigh = renderer.centerMidHigh
+        settings.calCenterHigh = renderer.centerHigh
+        settings.photoAuto = renderer.photoAuto
+        settings.photoInterval = renderer.photoMinInterval
+        settings.photoFit = renderer.photoFit
+        settings.photoSwap = renderer.photoSwap
+        settings.photoSwapSize = renderer.photoSwapSize
         settings.micSource = audio.source
         settings.autoGain = audio.autoGain
         for (i in params.indices) settings.setParam(i, params[i])
@@ -411,6 +586,18 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
         renderer.sceneRows = settings.pixelRows
         renderer.borderPx = settings.border
         renderer.speedSlider = settings.speedMul
+        renderer.text = settings.glitchText
+        renderer.textCeil = settings.textCeiling
+        renderer.distSource = settings.distSource
+        renderer.distWindow = settings.distWindow
+        renderer.centerFull = settings.calCenterFull
+        renderer.centerMidHigh = settings.calCenterMidHigh
+        renderer.centerHigh = settings.calCenterHigh
+        renderer.photoAuto = settings.photoAuto
+        renderer.photoMinInterval = settings.photoInterval
+        renderer.photoFit = settings.photoFit
+        renderer.photoSwap = settings.photoSwap
+        renderer.photoSwapSize = settings.photoSwapSize
 
         for (i in params.indices) params[i] = settings.getParam(i)
         renderer.mode = GLRenderer.safeMode(settings.mode)
@@ -468,6 +655,14 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
         renderer.sceneRows = 270
         renderer.borderPx = 0
         renderer.speedSlider = 0.5f
+        renderer.text = GLRenderer.DEFAULT_TEXT
+        settings.glitchText = GLRenderer.DEFAULT_TEXT
+        renderer.textCeil = 0.7f
+        renderer.photoAuto = true
+        renderer.photoMinInterval = 0.5f
+        renderer.photoFit = false
+        renderer.photoSwap = true
+        renderer.photoSwapSize = 0.5f
     }
 
     private fun resetAudio() {
@@ -476,6 +671,11 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
         audio.gain = gainMul()
         audio.beatSensitivity = 0.5f
         audio.reaction = 0.5f
+        renderer.distSource = 1
+        renderer.distWindow = 12f
+        renderer.centerFull = -30f
+        renderer.centerMidHigh = -35f
+        renderer.centerHigh = -42f
         audio.autoGain = false
         audio.source = 0
         settings.micDevice = "auto"
@@ -573,11 +773,11 @@ class MainActivity : ComponentActivity(), GestureController.Listener {
 
     override fun onGainScroll(factor: Float) {
         // свайп накапливается плавно, значение привязывается к шагу 0,25
-        gainRaw = (gainRaw + ln(factor) / ln(2f)).coerceIn(-2f, 2f)
+        gainRaw = (gainRaw + ln(factor) / ln(2f)).coerceIn(-6f, 2f)
         gainStep = (gainRaw * 4f).roundToInt() / 4f
         audio.gain = gainMul()
         overlay.showBar(
-            (gainStep + 2f) / 4f,
+            (gainStep + 6f) / 8f,
             String.format(Locale.US, "Gain %+.2f (x%.2f)", gainStep, gainMul()),
             OverlayView.SIDE_LEFT
         )

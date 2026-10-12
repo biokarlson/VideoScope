@@ -12,14 +12,14 @@ class AppSettings(context: Context) {
     /** Усиление микрофона в ступенях (-2..+2, шаг 0,25). Множитель = 2^ступень. */
     var gainStep: Float
         get() {
-            if (prefs.contains("gainStep")) return prefs.getFloat("gainStep", 0f).coerceIn(-2f, 2f)
+            if (prefs.contains("gainStep")) return prefs.getFloat("gainStep", 0f).coerceIn(-6f, 2f)
             // перенос старого значения-множителя (ключ "gain")
             val old = prefs.getFloat("gain", 1f).coerceAtLeast(0.01f)
-            val step = (ln(old) / ln(2f)).coerceIn(-2f, 2f)
+            val step = (ln(old) / ln(2f)).coerceIn(-6f, 2f)
             return (step * 4f).roundToInt() / 4f
         }
         set(v) {
-            val snapped = (v.coerceIn(-2f, 2f) * 4f).roundToInt() / 4f
+            val snapped = (v.coerceIn(-6f, 2f) * 4f).roundToInt() / 4f
             prefs.edit().putFloat("gainStep", snapped).apply()
         }
 
@@ -133,6 +133,62 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean("autoGain", false)
         set(v) { prefs.edit().putBoolean("autoGain", v).apply() }
 
+    /** Потолок искажения Text Glitch, 0..1 (на самом громком искажение не больше этого значения). */
+    var textCeiling: Float
+        get() = prefs.getFloat("textCeiling", 0.7f).coerceIn(0f, 1f)
+        set(v) { prefs.edit().putFloat("textCeiling", v.coerceIn(0f, 1f)).apply() }
+
+    /** Источник искажения (Text Glitch и Photo Glitch): 0 = полная громкость, 1 = середина и высокие, 2 = высокие. */
+    var distSource: Int
+        get() = prefs.getInt("distSource", 1).coerceIn(0, 2)
+        set(v) { prefs.edit().putInt("distSource", v.coerceIn(0, 2)).apply() }
+
+    /** Диапазон реакции, дБ: на столько дБ вокруг центра искажение идёт от 0 до максимума. */
+    var distWindow: Float
+        get() = prefs.getFloat("distWindow", 12f).coerceIn(6f, 30f)
+        set(v) { prefs.edit().putFloat("distWindow", v.coerceIn(6f, 30f)).apply() }
+
+    /** Центры калибровки, дБ: обычный уровень для каждого источника (значения по умолчанию подходят для усиления −3). */
+    var calCenterFull: Float
+        get() = prefs.getFloat("calCenterFull", -30f).coerceIn(-120f, 10f)
+        set(v) { prefs.edit().putFloat("calCenterFull", v.coerceIn(-120f, 10f)).apply() }
+    var calCenterMidHigh: Float
+        get() = prefs.getFloat("calCenterMidHigh", -35f).coerceIn(-120f, 10f)
+        set(v) { prefs.edit().putFloat("calCenterMidHigh", v.coerceIn(-120f, 10f)).apply() }
+    var calCenterHigh: Float
+        get() = prefs.getFloat("calCenterHigh", -42f).coerceIn(-120f, 10f)
+        set(v) { prefs.edit().putFloat("calCenterHigh", v.coerceIn(-120f, 10f)).apply() }
+
+    /** Photo Glitch: автосмена фото по звуку. */
+    var photoAuto: Boolean
+        get() = prefs.getBoolean("photoAuto", true)
+        set(v) { prefs.edit().putBoolean("photoAuto", v).apply() }
+
+    /** Photo Glitch: минимальный интервал смены фото, секунд (0,5..10). */
+    var photoInterval: Float
+        get() = prefs.getFloat("photoInterval", 0.5f).coerceIn(0.5f, 10f)
+        set(v) { prefs.edit().putFloat("photoInterval", v.coerceIn(0.5f, 10f)).apply() }
+
+    /** Photo Glitch: обмен кусков изображения на акцентах. */
+    var photoSwap: Boolean
+        get() = prefs.getBoolean("photoSwap", true)
+        set(v) { prefs.edit().putBoolean("photoSwap", v).apply() }
+
+    /** Photo Glitch: масштаб размера кусков, 0..1 (0,5 = обычный размер). */
+    var photoSwapSize: Float
+        get() = prefs.getFloat("photoSwapSize", 0.5f).coerceIn(0f, 1f)
+        set(v) { prefs.edit().putFloat("photoSwapSize", v.coerceIn(0f, 1f)).apply() }
+
+    /** Photo Glitch: false = заполнить экран (края обрезаются), true = вписать с чёрными полями. */
+    var photoFit: Boolean
+        get() = prefs.getBoolean("photoFit", false)
+        set(v) { prefs.edit().putBoolean("photoFit", v).apply() }
+
+    /** Текст для режима Text Glitch. */
+    var glitchText: String
+        get() = prefs.getString("glitchText", "ЧИСТЫЕ ВЕЧЕРИНКИ") ?: "ЧИСТЫЕ ВЕЧЕРИНКИ"
+        set(v) { prefs.edit().putString("glitchText", v).apply() }
+
     /** Показывать начальный экран с инструкцией при запуске. */
     var showStartScreen: Boolean
         get() = prefs.getBoolean("showStartScreen", true)
@@ -166,7 +222,19 @@ class AppSettings(context: Context) {
         o.put("exitGuard", exitGuard)
         o.put("gestureLock", gestureLock)
         o.put("showStartScreen", showStartScreen)
-        for (i in 0 until 5) o.put("param" + i, getParam(i).toDouble())
+        o.put("glitchText", glitchText)
+        o.put("textCeiling", textCeiling.toDouble())
+        o.put("distSource", distSource)
+        o.put("distWindow", distWindow.toDouble())
+        o.put("calCenterFull", calCenterFull.toDouble())
+        o.put("calCenterMidHigh", calCenterMidHigh.toDouble())
+        o.put("calCenterHigh", calCenterHigh.toDouble())
+        o.put("photoAuto", photoAuto)
+        o.put("photoInterval", photoInterval.toDouble())
+        o.put("photoFit", photoFit)
+        o.put("photoSwap", photoSwap)
+        o.put("photoSwapSize", photoSwapSize.toDouble())
+        for (i in 0 until 7) o.put("param" + i, getParam(i).toDouble())
         return o
     }
 
@@ -197,7 +265,19 @@ class AppSettings(context: Context) {
         exitGuard = o.optBoolean("exitGuard", exitGuard)
         gestureLock = o.optBoolean("gestureLock", gestureLock)
         showStartScreen = o.optBoolean("showStartScreen", showStartScreen)
-        for (i in 0 until 5) setParam(i, o.optDouble("param" + i, getParam(i).toDouble()).toFloat())
+        glitchText = o.optString("glitchText", glitchText)
+        textCeiling = o.optDouble("textCeiling", textCeiling.toDouble()).toFloat()
+        distSource = o.optInt("distSource", distSource)
+        distWindow = o.optDouble("distWindow", distWindow.toDouble()).toFloat()
+        calCenterFull = o.optDouble("calCenterFull", calCenterFull.toDouble()).toFloat()
+        calCenterMidHigh = o.optDouble("calCenterMidHigh", calCenterMidHigh.toDouble()).toFloat()
+        calCenterHigh = o.optDouble("calCenterHigh", calCenterHigh.toDouble()).toFloat()
+        photoAuto = o.optBoolean("photoAuto", photoAuto)
+        photoInterval = o.optDouble("photoInterval", photoInterval.toDouble()).toFloat()
+        photoFit = o.optBoolean("photoFit", photoFit)
+        photoSwap = o.optBoolean("photoSwap", photoSwap)
+        photoSwapSize = o.optDouble("photoSwapSize", photoSwapSize.toDouble()).toFloat()
+        for (i in 0 until 7) setParam(i, o.optDouble("param" + i, getParam(i).toDouble()).toFloat())
     }
 
     /** Последняя открытая вкладка меню: 0 = Видео, 1 = Аудио, 2 = Интерфейс. */

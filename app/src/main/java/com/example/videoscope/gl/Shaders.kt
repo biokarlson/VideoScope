@@ -23,6 +23,19 @@ precision mediump float;
 #endif
 uniform sampler2D uAudio;
 uniform sampler2D uStripes;
+uniform sampler2D uText;
+uniform sampler2D uPhoto;
+uniform float uDist;
+uniform float uScroll;
+uniform float uAspect;
+uniform float uPhotoAspect;
+uniform float uFit;
+uniform float uHasPhoto;
+uniform float uSwapEnv;
+uniform float uSwapSeed;
+uniform float uSwapCls;
+uniform float uSwapCount;
+uniform float uSwapScale;
 uniform float uTime;
 uniform float uMode;
 uniform float uParam;
@@ -183,12 +196,156 @@ vec3 modeLoader(vec2 uv) {
     return pal(p);
 }
 
+// Режим 4, Text Glitch: текст (атлас uText) на весь экран строками. Искажение uDist (0..1):
+// спокойно: текст читается; выше: колонки вытягиваются по спектру, строки сдвигаются срезами,
+// появляются крупные пиксели, перестановка и зеркало; на пике текст не узнать.
+// Строки движутся в разные стороны и с разной скоростью (uScroll накапливается на стороне кода).
+vec3 modeText(vec2 uv) {
+    float D = clamp(uDist, 0.0, 1.0);
+    float e = D * D;
+    float h = smoothstep(0.5, 1.0, D);
+    float tick = floor(uTime * 12.0);
+    vec2 p = uv;
+    // волны
+    p.x += sin(p.y * 30.0 + uTime * 4.0) * 0.012 * D + sin(p.y * 7.0 + uTime) * 0.01 * D * D;
+    p.y += sin(p.x * 18.0 + uTime * 3.0) * 0.02 * D * D;
+    // мозаика: крупные «пиксели» в случайных областях
+    float cellSize = mix(1.0 / 70.0, 1.0 / 16.0, h);
+    vec2 big = floor(p / (cellSize * 4.0));
+    float region = step(hash(big + tick * 0.5), h * 0.7);
+    p = mix(p, (floor(p / cellSize) + 0.5) * cellSize, region);
+    // срезы строк
+    float band = floor(p.y * 64.0);
+    float sh = hash(vec2(band, tick)) - 0.5;
+    float act = step(1.0 - (0.03 + 0.5 * e + 0.3 * uBeat * D), hash(vec2(band + 7.0, tick)));
+    p.x += sh * act * (0.03 + 0.7 * e);
+    // строки текста и растяжение колонок по настоящему спектру
+    float rowsF = floor(mix(5.0, 12.0, smoothstep(0.8, 1.0, D)) + 0.5);
+    float colsN = mix(16.0, 44.0, h);
+    float colI = floor(p.x * colsN);
+    float spec = texture2D(uAudio, vec2((colI + 0.5) / colsN, 0.75)).r;
+    spec = clamp(spec * 1.3 + 0.15 * hash(vec2(colI, floor(uTime * 9.0))), 0.0, 1.0);
+    float st = 1.0 + e * 7.0 * spec + smoothstep(0.2, 0.8, D) * 2.5 * hash(vec2(colI, 3.0)) + h * 6.0 * spec;
+    float rc = p.y * rowsF;
+    float row = floor(rc);
+    float fy = fract(rc);
+    fy = (fy - 0.5) / st + 0.5 + (hash(vec2(colI, row + tick)) - 0.5) * h * (st - 1.0) / st;
+    // у каждой строки своё направление и целый множитель скорости (+-1, +-2, +-3): стык при обороте не виден
+    float dir = (hash(vec2(row, 5.0)) < 0.5 ? -1.0 : 1.0) * (1.0 + floor(hash(vec2(row, 9.0)) * 3.0));
+    float shuffle = floor(hash(vec2(row, uSeed)) * 16.0) / 16.0 * smoothstep(0.55, 0.95, D);
+    float x = p.x + uScroll * dir + shuffle;
+    float mir = step(1.0 - h * 0.7, hash(vec2(colI + 11.0, uSeed))) * smoothstep(0.7, 1.0, D);
+    x = mix(x, 1.0 - x, mir);
+    x += (fy - 0.5) * e * 0.8 * (hash(vec2(colI + 5.0, row)) - 0.5);
+    // атлас загружен сверху вниз, поэтому v = 1 - fy
+    float m = texture2D(uText, vec2(fract(x), 1.0 - clamp(fy, 0.0, 1.0))).r;
+    m *= step(0.0, fy) * step(fy, 1.0);
+    m = step(0.5, m);
+    // инверсия на кик на пике
+    float inv = step(0.85, D) * step(0.55, uBeat);
+    m = mix(m, 1.0 - m, inv);
+    // цвет: цветная палитра чередует четыре цвета по строкам, ЧБ и монохром дают светлые буквы
+    vec3 fg;
+    if (uPalette < 0.5) {
+        float k = mod(row + floor(hash(vec2(colI, row)) * 4.0 * smoothstep(0.4, 0.9, D)) + floor(uTime * 12.0 / 16.0), 4.0);
+        fg = pal(k < 0.5 ? 0.0 : (k < 1.5 ? 2.0 : (k < 2.5 ? 1.0 : 3.0)));
+    } else {
+        fg = pal(3.0);
+    }
+    return fg * m;
+}
+
+// Обмен кусков (Photo Glitch): несколько случайных прямоугольников меняются местами с другими областями.
+// Размер зависит от триггера: 0 кик (крупные), 1 середина (средние), 2 высокие (мелкие).
+// Ширина и высота прямоугольника независимы. Смещение не выровнено, поэтому перенесённый кусок
+// может лишь частично накладываться на прежнее место или на другие куски.
+vec2 swapPatches(vec2 p) {
+    if (uSwapEnv < 0.08 || uSwapCount < 0.5) return p;
+    float sMin = 0.25;
+    float sMax = 0.60;
+    if (uSwapCls > 1.5) {
+        sMin = 0.03;
+        sMax = 0.10;
+    } else if (uSwapCls > 0.5) {
+        sMin = 0.10;
+        sMax = 0.25;
+    }
+    for (int k = 0; k < 6; k++) {
+        float fk = float(k);
+        if (fk >= uSwapCount) break;
+        vec2 h1 = vec2(hash(vec2(fk, uSwapSeed)), hash(vec2(fk + 11.0, uSwapSeed)));
+        vec2 h2 = vec2(hash(vec2(fk + 23.0, uSwapSeed)), hash(vec2(fk + 37.0, uSwapSeed)));
+        vec2 h3 = vec2(hash(vec2(fk + 51.0, uSwapSeed)), hash(vec2(fk + 67.0, uSwapSeed)));
+        vec2 sz = clamp((vec2(sMin) + (sMax - sMin) * h1) * uSwapScale, vec2(0.02), vec2(0.9));
+        vec2 a = h2 * (vec2(1.0) - sz);
+        vec2 off = (h3 - 0.5) * (sz + vec2(0.35)) * 2.0;
+        vec2 b = clamp(a + off, vec2(0.0), vec2(1.0) - sz);
+        vec2 d = b - a;
+        vec2 inB = step(b, p) * step(p, b + sz);
+        vec2 inA = step(a, p) * step(p, a + sz);
+        if (inB.x * inB.y > 0.5) p -= d;
+        else if (inA.x * inA.y > 0.5) p += d;
+    }
+    return p;
+}
+
+// Режим 5, Photo Glitch: фото (uPhoto) с искажениями: сдвиг срезов, мозаика, RGB shift.
+// Сила искажения uDist (0..1) приходит из громкости с потолком.
+vec3 modePhoto(vec2 uv) {
+    // фото ещё не добавлены или не загружены: плоские цветные полосы-заглушка
+    if (uHasPhoto < 0.5) {
+        return pal(floor(uv.x * 5.0)) * step(0.5, fract(uv.y * 6.0 + uTime * 0.2));
+    }
+    float D = clamp(uDist, 0.0, 1.0);
+    float e = D * D;
+    float tick = floor(uTime * 12.0);
+    vec2 p = swapPatches(uv);
+    // сдвиг срезов
+    float band = floor(p.y * 48.0);
+    float sh = hash(vec2(band, tick)) - 0.5;
+    float act = step(1.0 - (0.04 + 0.6 * D + 0.3 * uBeat), hash(vec2(band + 3.0, tick)));
+    p.x += sh * act * (0.02 + 0.5 * D);
+    // мозаика: крупные блоки в случайных областях
+    float cell = mix(1.0 / 90.0, 1.0 / 14.0, e);
+    vec2 big = floor(p / (cell * 3.0));
+    float region = step(hash(big + tick * 0.5), D * 0.8);
+    p = mix(p, (floor(p / cell) + 0.5) * cell, region);
+    // положение в фото: заполнить (края обрезаются) или вписать (чёрные поля)
+    vec2 t;
+    if (uFit < 0.5) {
+        if (uAspect > uPhotoAspect) t = vec2(p.x, 0.5 + (p.y - 0.5) * (uPhotoAspect / uAspect));
+        else t = vec2(0.5 + (p.x - 0.5) * (uAspect / uPhotoAspect), p.y);
+    } else {
+        if (uAspect > uPhotoAspect) t = vec2(0.5 + (p.x - 0.5) * (uAspect / uPhotoAspect), p.y);
+        else t = vec2(p.x, 0.5 + (p.y - 0.5) * (uPhotoAspect / uAspect));
+    }
+    float inside = step(0.0, t.x) * step(t.x, 1.0) * step(0.0, t.y) * step(t.y, 1.0);
+    // RGB shift: каналы расходятся по горизонтали, зелёный чуть уходит по вертикали
+    float rs = (0.003 + 0.05 * e) * (0.4 + 0.6 * hash(vec2(band, tick + 5.0)));
+    vec2 tr = vec2(t.x + rs, t.y);
+    vec2 tg = vec2(t.x, t.y + 0.02 * e * (hash(vec2(band, tick)) - 0.5));
+    vec2 tb = vec2(t.x - rs, t.y);
+    // фото загружено сверху вниз, поэтому v = 1 - y
+    vec3 c;
+    c.r = texture2D(uPhoto, vec2(tr.x, 1.0 - tr.y)).r;
+    c.g = texture2D(uPhoto, vec2(tg.x, 1.0 - tg.y)).g;
+    c.b = texture2D(uPhoto, vec2(tb.x, 1.0 - tb.y)).b;
+    c *= inside;
+    float l = dot(c, vec3(0.299, 0.587, 0.114));
+    if (uPalette > 0.5 && uPalette < 1.5) {
+        c = vec3(l);
+    } else if (uPalette > 1.5) {
+        c = hsv2rgb(vec3(uMonoHue, uMonoSat * (1.0 - 0.5 * l), l));
+    }
+    return c;
+}
+
 void main() {
     float m = uMode;
     bool fromRandom = false;
     // Random временно отключён (RANDOM_ENABLED = false в GLRenderer): тогда uMode не бывает больше 3.
-    // Индексы режимов: 0 Basic Line, 1 Color Shifter, 2 Trapezoid, 3 Loader, 4 Random.
-    if (m > 3.5) {
+    // Индексы режимов: 0 Basic Line, 1 Color Shifter, 2 Trapezoid, 3 Loader, 4 Text Glitch, 5 Photo Glitch, 6 Random.
+    if (m > 5.5) {
         // Random: смена подрежимов с регулируемой скоростью (подрежим 3 = горизонтальные полосы)
         float interval = mix(5.0, 0.6, uParam);
         m = floor(hash(vec2(floor(uTime / interval), 7.0)) * 4.0);
@@ -199,7 +356,9 @@ void main() {
     else if (m < 1.5) col = modeZones(vUv);
     else if (m < 2.5) col = modeBlocks(vUv);
     else if (fromRandom) col = modeRuns(vUv);
-    else col = modeLoader(vUv);
+    else if (m < 3.5) col = modeLoader(vUv);
+    else if (m < 4.5) col = modeText(vUv);
+    else col = modePhoto(vUv);
     gl_FragColor = vec4(col, 1.0);
 }
 """
@@ -240,7 +399,7 @@ vec3 hsv2rgb(vec3 c) {
 void main() {
     vec2 uv = vUv;
     float gv = uVhs;     // сила VHS: полоса, scanlines, rolling bars, виньетка
-    float gg = uGlitch;  // сила Glitch: сдвиги строк, цветной глитч, блоки, мерцание, RGB-кайма
+    float gg = uGlitch;  // сила Glitch: сдвиги строк, цветной глитч, мерцание, RGB-кайма
     float gn = uNoise;   // сила Noise: аналоговый шум
     // spike: короткий всплеск на удар; beat: громкость + удар (непрерывная амплитуда искажений)
     float spike = uBeat * gg;
@@ -260,31 +419,36 @@ void main() {
     uv.x += inBand * sin(uv.y * 90.0 + uTime * 25.0) * 0.03 * (0.3 + uMid) * gv;
     uv.x += sin(uv.y * 240.0 + uTime * 6.0) * 0.0007 * gv;
 
-    // 3. RGB-сдвиг + цветной глитч: каждый канал смещается по-своему в случайных строках
+    // 3. RGB-кайма + цветной глитч в широких строках (22 строки по высоте, в 4 раза шире прежних):
+    // в цветной палитре каждый канал смещается по-своему, а иногда каналы меняются местами;
+    // в ЧБ и монохроме в тех же строках вместо цвета меняется яркость
     float ca = (0.0012 + 0.010 * uLevel + 0.008 * uHigh) * gg + 0.008 * beat;
-    float rowC = floor(vUv.y * 90.0);
+    float bw = step(0.5, uPalette);
+    float rowC = floor(vUv.y * 22.5);
     float cg = step(1.0 - 0.30 * beat, hash(vec2(rowC, tick + 5.0)));
     vec3 off = (vec3(hash(vec2(rowC, tick + 1.0)),
                      hash(vec2(rowC, tick + 2.0)),
-                     hash(vec2(rowC, tick + 3.0))) - 0.5) * 0.10 * beat * cg;
+                     hash(vec2(rowC, tick + 3.0))) - 0.5) * 0.10 * beat * cg * (1.0 - bw);
     vec3 col;
     col.r = texture2D(uTex, vec2(uv.x + ca + off.x, uv.y)).r;
     col.g = texture2D(uTex, vec2(uv.x + off.y, uv.y)).g;
     col.b = texture2D(uTex, vec2(uv.x - ca + off.z, uv.y)).b;
 
-    // перестановка каналов в случайных строках (цветной глитч)
+    // перестановка каналов (цветная палитра) или смена яркости (ЧБ и монохром) в тех же широких строках
     float swp = hash(vec2(rowC * 0.5, tick + 7.0));
-    if (swp > 1.0 - 0.18 * beat) col = col.gbr;
-    else if (swp < 0.10 * beat) col = col.brg;
+    float swapA = step(1.0 - 0.18 * beat, swp);
+    float swapB = (1.0 - swapA) * step(swp, 0.10 * beat);
+    if (bw < 0.5) {
+        if (swapA > 0.5) col = col.gbr;
+        else if (swapB > 0.5) col = col.brg;
+    } else {
+        float act = max(cg, max(swapA, swapB));
+        float hb = hash(vec2(rowC, tick + 11.0));
+        vec3 alt = hb < 0.34 ? 1.0 - col : (hb < 0.67 ? col * 1.9 : col * 0.25);
+        col = mix(col, alt, act);
+    }
 
-    // 4. цветные блоки-помехи
-    vec2 blk = floor(vUv * vec2(18.0, 10.0));
-    float bh = hash(blk + tick * 1.7);
-    float corrupt = step(1.0 - 0.035 * spike, bh);
-    vec3 noiseCol = vec3(hash(blk + 1.0 + tick), hash(blk + 2.0 + tick), hash(blk + 3.0 + tick));
-    col = mix(col, noiseCol, corrupt * 0.85);
-
-    // 5. мерцание на бит
+    // 4. мерцание на бит
     col *= 1.0 + spike * 0.30 * (hash(vec2(tick, 1.0)) - 0.35);
 
     // 6. scanlines
